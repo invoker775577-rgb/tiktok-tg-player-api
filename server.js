@@ -5,26 +5,41 @@
  * (render.com), что и фронт. Нужно потому, что workers.dev заблокирован
  * у части операторов (подтверждено: Беларусь, ERR_CONNECTION_TIMED_OUT).
  *
- * Хранилище: библиотека и плейлисты — в файле library.json на диске Render
- * (диск эфемерный на free-тарифе — переживает рестарт процесса, но не redeploy;
- * это ок, т.к. uploader.py каждый раз шлёт актуальную копию через /api/ingest).
+ * Хранилище: библиотека и плейлисты держатся в памяти процесса (быстрые
+ * ответы), а на постоянку пишутся в library.json файла в GitHub-репозитории
+ * через GitHub Contents API. При каждом старте процесс подтягивает файл
+ * с GitHub заново — так библиотека переживает ЛЮБОЙ рестарт контейнера,
+ * а не только редеплой.
+ *
+ * ВАЖНО: диск Render (fs.writeFileSync в локальный файл) — эфемерный.
+ * Он стирается при каждом рестарте процесса (сон/пробуждение, не только
+ * при новом деплое) — так один раз уже потерялась вся библиотека.
+ * GitHub — единственное постоянное хранилище в этой архитектуре.
  */
 
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const INGEST_KEY = process.env.INGEST_KEY;
-const DATA_FILE = path.join(__dirname, 'library.json');
+
+// GitHub — постоянное хранилище library.json
+const GH_TOKEN = process.env.GITHUB_TOKEN;
+const GH_REPO = process.env.GITHUB_REPO || 'invoker775577-rgb/tiktok-tg-player';
+const GH_PATH = process.env.GITHUB_LIBRARY_PATH || 'api-render/library.json';
+const GH_BRANCH = process.env.GITHUB_BRANCH || 'master';
 
 if (!BOT_TOKEN) {
   console.error('BOT_TOKEN не задан — установи переменную окружения на Render');
   process.exit(1);
 }
+if (!GH_TOKEN) {
+  console.error('GITHUB_TOKEN не задан — без него библиотека не переживёт рестарт. Установи переменную окружения на Render.');
+  process.exit(1);
+}
 
 const TG_API = 'https://api.telegram.org';
+const GH_API = `https://api.github.com/repos/${GH_REPO}/contents/${GH_PATH}`;
 const FILE_PATH_TTL_MS = 30 * 60 * 1000;
 
 const app = express();
@@ -38,17 +53,78 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Хранилище на диске ───────────────────────────────────────
-function loadLibrary() {
+// ── Хранилище: память процесса + GitHub как постоянный бэкенд ─
+let library = { videos: [], playlists: {} };
+let librarySha = null; // sha текущего файла на GitHub — нужен для PUT (обновление)
+
+function ghHeaders() {
+  return {
+    Authorization: `Bearer ${GH_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'Content-Type': 'application/json',
+  };
+}
+
+/** Подтягивает library.json с GitHub в память. Вызывается при старте процесса. */
+async function loadLibraryFromGitHub() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
-    return { videos: [], playlists: {} };
+    const res = await fetch(`${GH_API}?ref=${GH_BRANCH}`, { headers: ghHeaders() });
+
+    if (res.status === 404) {
+      console.log('library.json ещё не существует на GitHub — стартуем с пустой библиотекой');
+      librarySha = null;
+      return;
+    }
+    if (!res.ok) {
+      console.error(`GitHub API вернул ${res.status} при чтении library.json — библиотека останется пустой до /api/ingest`);
+      return;
+    }
+
+    const data = await res.json();
+    librarySha = data.sha;
+    const content = Buffer.from(data.content, 'base64').toString('utf8');
+    const parsed = JSON.parse(content);
+
+    library = {
+      videos: Array.isArray(parsed.videos) ? parsed.videos : [],
+      playlists: parsed.playlists && typeof parsed.playlists === 'object' ? parsed.playlists : {},
+    };
+    console.log(`Библиотека загружена с GitHub: ${library.videos.length} видео, ${Object.keys(library.playlists).length} плейлистов`);
+  } catch (e) {
+    console.error('Не удалось загрузить library.json с GitHub:', e.message);
   }
 }
 
-function saveLibrary(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data), 'utf8');
+/** Сохраняет текущую библиотеку в память И коммитит на GitHub. */
+async function saveLibrary() {
+  try {
+    const content = Buffer.from(JSON.stringify(library, null, 2), 'utf8').toString('base64');
+    const body = {
+      message: `Update library: ${library.videos.length} videos, ${Object.keys(library.playlists).length} playlists`,
+      content,
+      branch: GH_BRANCH,
+      ...(librarySha ? { sha: librarySha } : {}),
+    };
+
+    const res = await fetch(GH_API, {
+      method: 'PUT',
+      headers: ghHeaders(),
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`Не удалось сохранить library.json на GitHub (${res.status}):`, errText.slice(0, 300));
+      return false;
+    }
+
+    const data = await res.json();
+    librarySha = data.content.sha; // следующий PUT должен ссылаться на новый sha
+    return true;
+  } catch (e) {
+    console.error('Ошибка при сохранении library.json на GitHub:', e.message);
+    return false;
+  }
 }
 
 // ── Кэш file_path (getFile) в памяти процесса ───────────────
@@ -75,21 +151,20 @@ async function resolveFilePath(fileId) {
 
 // ── Роуты ────────────────────────────────────────────────────
 app.get('/api/library', (req, res) => {
-  res.json(loadLibrary());
+  res.json(library);
 });
 
-app.post('/api/playlists', (req, res) => {
+app.post('/api/playlists', async (req, res) => {
   const playlists = req.body;
   if (playlists === null || typeof playlists !== 'object' || Array.isArray(playlists)) {
     return res.status(400).json({ ok: false, error: 'expected object' });
   }
-  const lib = loadLibrary();
-  lib.playlists = playlists;
-  saveLibrary(lib);
-  res.json({ ok: true });
+  library.playlists = playlists;
+  const saved = await saveLibrary();
+  res.json({ ok: true, persisted: saved });
 });
 
-app.post('/api/ingest', (req, res) => {
+app.post('/api/ingest', async (req, res) => {
   const key = req.header('x-ingest-key');
   if (!INGEST_KEY || key !== INGEST_KEY) {
     return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -100,14 +175,13 @@ app.post('/api/ingest', (req, res) => {
     return res.status(400).json({ ok: false, error: 'videos must be an array' });
   }
 
-  const lib = loadLibrary();
-  lib.videos = body.videos;
+  library.videos = body.videos;
   if (body.playlists && typeof body.playlists === 'object' && !Array.isArray(body.playlists)) {
-    lib.playlists = body.playlists;
+    library.playlists = body.playlists;
   }
-  saveLibrary(lib);
 
-  res.json({ ok: true, count: body.videos.length });
+  const saved = await saveLibrary();
+  res.json({ ok: true, count: body.videos.length, persisted: saved });
 });
 
 app.get('/api/video/:fileId', async (req, res) => {
@@ -155,4 +229,8 @@ app.get('/api/video/:fileId', async (req, res) => {
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
-app.listen(PORT, () => console.log(`API listening on :${PORT}`));
+// Библиотека грузится с GitHub ДО того, как сервис начнёт принимать трафик —
+// иначе первые запросы после рестарта получат пустой список.
+loadLibraryFromGitHub().then(() => {
+  app.listen(PORT, () => console.log(`API listening on :${PORT}`));
+});
