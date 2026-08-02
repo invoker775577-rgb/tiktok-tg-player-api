@@ -56,6 +56,7 @@ app.use((req, res, next) => {
 // ── Хранилище: память процесса + GitHub как постоянный бэкенд ─
 let library = { videos: [], playlists: {} };
 let librarySha = null; // sha текущего файла на GitHub — нужен для PUT (обновление)
+let libraryLoaded = false; // true после успешной загрузки с GitHub при старте
 
 function ghHeaders() {
   return {
@@ -65,33 +66,59 @@ function ghHeaders() {
   };
 }
 
-/** Подтягивает library.json с GitHub в память. Вызывается при старте процесса. */
+/** Одна попытка забрать library.json с GitHub. Бросает исключение при неудаче. */
+async function fetchLibraryFromGitHubOnce() {
+  const res = await fetch(`${GH_API}?ref=${GH_BRANCH}`, {
+    headers: ghHeaders(),
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (res.status === 404) {
+    console.log('library.json ещё не существует на GitHub — стартуем с пустой библиотекой');
+    librarySha = null;
+    return;
+  }
+  if (!res.ok) {
+    throw new Error(`GitHub API вернул ${res.status}`);
+  }
+
+  const data = await res.json();
+  librarySha = data.sha;
+  const content = Buffer.from(data.content, 'base64').toString('utf8');
+  const parsed = JSON.parse(content);
+
+  library = {
+    videos: Array.isArray(parsed.videos) ? parsed.videos : [],
+    playlists: parsed.playlists && typeof parsed.playlists === 'object' ? parsed.playlists : {},
+  };
+  console.log(`Библиотека загружена с GitHub: ${library.videos.length} видео, ${Object.keys(library.playlists).length} плейлистов`);
+}
+
+/**
+ * Подтягивает library.json с GitHub в память при старте процесса.
+ *
+ * Раньше одна сетевая заминка при старте (таймаут, DNS-глюк, лимит GitHub
+ * API) навсегда оставляла library пустой на весь жизненный цикл процесса —
+ * сервер отвечал 200, но с 0 видео, и выглядело как "приложение умерло",
+ * хотя на GitHub данные были целы. Теперь: 5 попыток с растущей паузой,
+ * и если все провалились — процесс не стартует вообще (Render сам его
+ * перезапустит), вместо того чтобы тихо обслуживать пустоту.
+ */
 async function loadLibraryFromGitHub() {
-  try {
-    const res = await fetch(`${GH_API}?ref=${GH_BRANCH}`, { headers: ghHeaders() });
+  const MAX_ATTEMPTS = 5;
 
-    if (res.status === 404) {
-      console.log('library.json ещё не существует на GitHub — стартуем с пустой библиотекой');
-      librarySha = null;
-      return;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await fetchLibraryFromGitHubOnce();
+      libraryLoaded = true;
+      return; // успех (включая честный 404 — библиотеки на GitHub ещё нет)
+    } catch (e) {
+      console.error(`Попытка ${attempt}/${MAX_ATTEMPTS} загрузить library.json с GitHub провалилась:`, e.message);
+      if (attempt === MAX_ATTEMPTS) {
+        throw new Error(`Не удалось загрузить библиотеку с GitHub после ${MAX_ATTEMPTS} попыток — не стартуем с пустыми данными`);
+      }
+      await new Promise((r) => setTimeout(r, attempt * 2000)); // 2s, 4s, 6s, 8s
     }
-    if (!res.ok) {
-      console.error(`GitHub API вернул ${res.status} при чтении library.json — библиотека останется пустой до /api/ingest`);
-      return;
-    }
-
-    const data = await res.json();
-    librarySha = data.sha;
-    const content = Buffer.from(data.content, 'base64').toString('utf8');
-    const parsed = JSON.parse(content);
-
-    library = {
-      videos: Array.isArray(parsed.videos) ? parsed.videos : [],
-      playlists: parsed.playlists && typeof parsed.playlists === 'object' ? parsed.playlists : {},
-    };
-    console.log(`Библиотека загружена с GitHub: ${library.videos.length} видео, ${Object.keys(library.playlists).length} плейлистов`);
-  } catch (e) {
-    console.error('Не удалось загрузить library.json с GitHub:', e.message);
   }
 }
 
@@ -151,6 +178,12 @@ async function resolveFilePath(fileId) {
 
 // ── Роуты ────────────────────────────────────────────────────
 app.get('/api/library', (req, res) => {
+  // На практике недостижимо (app.listen идёт только после успешной загрузки),
+  // но если каким-то образом до сюда дошли раньше — лучше явная 503, чтобы
+  // фронт показал "не загрузилось, обнови", а не молчаливые 0 видео.
+  if (!libraryLoaded) {
+    return res.status(503).json({ ok: false, error: 'library not loaded yet, retry' });
+  }
   res.json(library);
 });
 
@@ -230,7 +263,14 @@ app.get('/api/video/:fileId', async (req, res) => {
 app.get('/healthz', (req, res) => res.send('ok'));
 
 // Библиотека грузится с GitHub ДО того, как сервис начнёт принимать трафик —
-// иначе первые запросы после рестарта получат пустой список.
-loadLibraryFromGitHub().then(() => {
-  app.listen(PORT, () => console.log(`API listening on :${PORT}`));
-});
+// иначе первые запросы после рестарта получат пустой список. Если загрузка
+// провалилась после всех повторов — процесс завершается с ошибкой, а не
+// стартует молча с пустой библиотекой (Render перезапустит его сам).
+loadLibraryFromGitHub()
+  .then(() => {
+    app.listen(PORT, () => console.log(`API listening on :${PORT}`));
+  })
+  .catch((e) => {
+    console.error('ФАТАЛЬНО: не смог поднять библиотеку при старте —', e.message);
+    process.exit(1);
+  });
