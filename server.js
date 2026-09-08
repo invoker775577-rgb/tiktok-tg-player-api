@@ -1,276 +1,244 @@
-/**
- * TikTok TG Player — API (Render Web Service)
- *
- * Порт Cloudflare Worker'а на Node/Express — чтобы API жил на том же домене
- * (render.com), что и фронт. Нужно потому, что workers.dev заблокирован
- * у части операторов (подтверждено: Беларусь, ERR_CONNECTION_TIMED_OUT).
- *
- * Хранилище: библиотека и плейлисты держатся в памяти процесса (быстрые
- * ответы), а на постоянку пишутся в library.json файла в GitHub-репозитории
- * через GitHub Contents API. При каждом старте процесс подтягивает файл
- * с GitHub заново — так библиотека переживает ЛЮБОЙ рестарт контейнера,
- * а не только редеплой.
- *
- * ВАЖНО: диск Render (fs.writeFileSync в локальный файл) — эфемерный.
- * Он стирается при каждом рестарте процесса (сон/пробуждение, не только
- * при новом деплое) — так один раз уже потерялась вся библиотека.
- * GitHub — единственное постоянное хранилище в этой архитектуре.
- */
-
 const express = require('express');
-
-const PORT = process.env.PORT || 3000;
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const INGEST_KEY = process.env.INGEST_KEY;
-
-// GitHub — постоянное хранилище library.json
-const GH_TOKEN = process.env.GITHUB_TOKEN;
-const GH_REPO = process.env.GITHUB_REPO || 'invoker775577-rgb/tiktok-tg-player';
-const GH_PATH = process.env.GITHUB_LIBRARY_PATH || 'api-render/library.json';
+const { Readable, Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { randomUUID } = require('node:crypto');
+const { createStore, mergeIngest, deleteVideo, restoreVideo } = require('./library-store');
+const { authorized } = require('./auth');
+const { prepareVideo } = require('./media');
+const VERSION = '2026.09.08.1';
+const BOT_TOKEN = process.env.BOT_TOKEN, INGEST_KEY = process.env.INGEST_KEY, GH_TOKEN = process.env.GITHUB_TOKEN, CHAT_ID = process.env.CHAT_ID;
+const OWNER_IDS = (process.env.OWNER_IDS || CHAT_ID || '').split(',').map((id) => id.trim());
 const GH_BRANCH = process.env.GITHUB_BRANCH || 'master';
-
-if (!BOT_TOKEN) {
-  console.error('BOT_TOKEN не задан — установи переменную окружения на Render');
-  process.exit(1);
-}
-if (!GH_TOKEN) {
-  console.error('GITHUB_TOKEN не задан — без него библиотека не переживёт рестарт. Установи переменную окружения на Render.');
-  process.exit(1);
-}
-
-const TG_API = 'https://api.telegram.org';
-const GH_API = `https://api.github.com/repos/${GH_REPO}/contents/${GH_PATH}`;
-const FILE_PATH_TTL_MS = 30 * 60 * 1000;
-
+const GH_API = process.env.GITHUB_CONTENTS_URL || `https://api.github.com/repos/${process.env.GITHUB_REPO || 'invoker775577-rgb/tiktok-tg-player'}/contents/${process.env.GITHUB_LIBRARY_PATH || 'api-render/library.json'}`;
+const TG_API = process.env.TELEGRAM_API_URL || 'https://api.telegram.org';
+const MAX_UPLOAD = 512 * 1024 * 1024;
 const app = express();
-app.use(express.json({ limit: '2mb' }));
-
+app.disable('x-powered-by');
 app.use((req, res, next) => {
-  res.header('access-control-allow-origin', '*');
-  res.header('access-control-allow-methods', 'GET, POST, OPTIONS');
-  res.header('access-control-allow-headers', 'content-type, x-ingest-key');
+  res.set({ 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, HEAD, POST, DELETE, OPTIONS', 'access-control-allow-headers': 'content-type, x-ingest-key, x-telegram-init-data, range', 'access-control-expose-headers': 'content-length, content-range, accept-ranges', 'x-content-type-options': 'nosniff' });
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
-
-// ── Хранилище: память процесса + GitHub как постоянный бэкенд ─
-let library = { videos: [], playlists: {} };
-let librarySha = null; // sha текущего файла на GitHub — нужен для PUT (обновление)
-let libraryLoaded = false; // true после успешной загрузки с GitHub при старте
-
-function ghHeaders() {
-  return {
-    Authorization: `Bearer ${GH_TOKEN}`,
-    Accept: 'application/vnd.github+json',
-    'Content-Type': 'application/json',
-  };
+app.use(express.json({ limit: '4mb' }));
+const route = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+const error = (status, message) => Object.assign(new Error(message), { status });
+const ghHeaders = () => ({ Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' });
+const store = createStore({
+  async read() {
+    const response = await fetch(`${GH_API}?ref=${encodeURIComponent(GH_BRANCH)}`, { headers: ghHeaders(), signal: AbortSignal.timeout(20000) });
+    if (!response.ok) throw error(503, `Хранилище временно недоступно (${response.status})`);
+    const file = await response.json();
+    return { data: JSON.parse(Buffer.from(file.content, 'base64').toString('utf8')), sha: file.sha };
+  },
+  async write(data, sha) {
+    const response = await fetch(GH_API, { method: 'PUT', headers: ghHeaders(), signal: AbortSignal.timeout(20000), body: JSON.stringify({ message: `Update library: ${data.videos.length} videos [skip ci]`, content: Buffer.from(JSON.stringify(data, null, 2)).toString('base64'), branch: GH_BRANCH, sha }) });
+    if (!response.ok) throw error(response.status === 409 ? 409 : 503, 'Не удалось сохранить изменения. Повторите попытку.');
+  },
+});
+function auth(req, res, next) {
+  if (authorized(req.headers, { botToken: BOT_TOKEN, ingestKey: INGEST_KEY, ownerIds: OWNER_IDS })) return next();
+  res.status(401).json({ ok: false, error: 'Откройте плеер из своего Telegram или введите ключ доступа' });
 }
-
-/** Одна попытка забрать library.json с GitHub. Бросает исключение при неудаче. */
-async function fetchLibraryFromGitHubOnce() {
-  const res = await fetch(`${GH_API}?ref=${GH_BRANCH}`, {
-    headers: ghHeaders(),
-    signal: AbortSignal.timeout(10_000),
+function ready(req, res, next) { return store.value ? next() : res.status(503).json({ error: 'Библиотека загружается' }); }
+const safeName = (name) => typeof name === 'string' && name.trim().length > 0 && name.length <= 240 && !/[\x00-\x1f/\\]/.test(name) && !['__proto__', 'constructor', 'prototype'].includes(name);
+const validId = (id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(id);
+function validPlaylists(value) { return value && !Array.isArray(value) && typeof value === 'object' && Object.entries(value).every(([key, items]) => safeName(key) && Array.isArray(items) && items.length <= 20000 && items.every(safeName)); }
+app.get('/healthz', (req, res) => res.status(store.value ? 200 : 503).json({ ok: !!store.value, version: VERSION }));
+app.get('/api/library', ready, (req, res) => res.set('cache-control', 'private, no-cache').json({ videos: store.value.videos, playlists: store.value.playlists }));
+app.get('/api/access', auth, (req, res) => res.json({ ok: true, upload: !!CHAT_ID, maxUploadBytes: MAX_UPLOAD }));
+app.post('/api/playlists', auth, ready, route(async (req, res) => {
+  if (!validPlaylists(req.body)) throw error(400, 'Некорректные плейлисты');
+  await store.mutate((draft) => { draft.playlists = req.body; });
+  res.json({ ok: true, persisted: true });
+}));
+app.post('/api/ingest', auth, ready, route(async (req, res) => {
+  if (!Array.isArray(req.body?.videos) || !req.body.videos.every((v) => safeName(v.name) && validId(v.file_id) && Number.isFinite(v.size) && v.size > 0) || (req.body.playlists && !validPlaylists(req.body.playlists))) throw error(400, 'Некорректная библиотека');
+  await store.mutate((draft) => mergeIngest(draft, req.body));
+  res.json({ ok: true, count: store.value.videos.length, persisted: true });
+}));
+app.post('/api/playlists/:name', auth, ready, route(async (req, res) => {
+  if (!safeName(req.params.name)) throw error(400, 'Некорректное название');
+  await store.mutate((draft) => {
+    if (Object.hasOwn(draft.playlists, req.params.name)) throw error(409, 'Такой плейлист уже существует');
+    draft.playlists[req.params.name] = [];
   });
-
-  if (res.status === 404) {
-    console.log('library.json ещё не существует на GitHub — стартуем с пустой библиотекой');
-    librarySha = null;
-    return;
-  }
-  if (!res.ok) {
-    throw new Error(`GitHub API вернул ${res.status}`);
-  }
-
-  const data = await res.json();
-  librarySha = data.sha;
-  const content = Buffer.from(data.content, 'base64').toString('utf8');
-  const parsed = JSON.parse(content);
-
-  library = {
-    videos: Array.isArray(parsed.videos) ? parsed.videos : [],
-    playlists: parsed.playlists && typeof parsed.playlists === 'object' ? parsed.playlists : {},
-  };
-  console.log(`Библиотека загружена с GitHub: ${library.videos.length} видео, ${Object.keys(library.playlists).length} плейлистов`);
+  res.json({ ok: true, persisted: true, playlists: store.value.playlists });
+}));
+app.post('/api/playlists/:name/items', auth, ready, route(async (req, res) => {
+  if (!safeName(req.params.name) || !safeName(req.body?.name) || typeof req.body.present !== 'boolean') throw error(400, 'Некорректные данные');
+  await store.mutate((draft) => {
+    const items = draft.playlists[req.params.name];
+    if (!Array.isArray(items) || !draft.videos.some((v) => v.name === req.body.name)) throw error(404, 'Плейлист или видео не найдено');
+    draft.playlists[req.params.name] = items.filter((name) => name !== req.body.name);
+    if (req.body.present) draft.playlists[req.params.name].unshift(req.body.name);
+  });
+  res.json({ ok: true, persisted: true, playlists: store.value.playlists });
+}));
+app.delete('/api/videos/:name', auth, ready, route(async (req, res) => {
+  if (!safeName(req.params.name)) throw error(400, 'Некорректное имя');
+  await store.mutate((draft) => deleteVideo(draft, req.params.name));
+  res.json({ ok: true, persisted: true });
+}));
+app.post('/api/videos/:name/restore', auth, ready, route(async (req, res) => {
+  if (!safeName(req.params.name)) throw error(400, 'Некорректное имя');
+  await store.mutate((draft) => restoreVideo(draft, req.params.name));
+  res.json({ ok: true, persisted: true });
+}));
+const filePaths = new Map(), resolving = new Map();
+async function resolveFile(fileId) {
+  const cached = filePaths.get(fileId);
+  if (cached?.expires > Date.now()) return cached.path;
+  if (resolving.has(fileId)) return resolving.get(fileId);
+  const operation = (async () => {
+    const response = await fetch(`${TG_API}/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`, { signal: AbortSignal.timeout(20000) });
+    const data = await response.json();
+    if (!data.ok || !data.result?.file_path) throw error(data.description?.includes('too big') ? 422 : response.status === 429 ? 503 : 404, data.description?.includes('too big') ? 'Этот старый файл превышает лимит Telegram. Загрузите его повторно.' : 'Видео временно недоступно');
+    if (filePaths.size >= 2048) filePaths.delete(filePaths.keys().next().value);
+    filePaths.set(fileId, { path: data.result.file_path, expires: Date.now() + 1800000 });
+    return data.result.file_path;
+  })();
+  resolving.set(fileId, operation);
+  try { return await operation; } finally { resolving.delete(fileId); }
 }
-
-/**
- * Подтягивает library.json с GitHub в память при старте процесса.
- *
- * Раньше одна сетевая заминка при старте (таймаут, DNS-глюк, лимит GitHub
- * API) навсегда оставляла library пустой на весь жизненный цикл процесса —
- * сервер отвечал 200, но с 0 видео, и выглядело как "приложение умерло",
- * хотя на GitHub данные были целы. Теперь: 5 попыток с растущей паузой,
- * и если все провалились — процесс не стартует вообще (Render сам его
- * перезапустит), вместо того чтобы тихо обслуживать пустоту.
- */
-async function loadLibraryFromGitHub() {
-  const MAX_ATTEMPTS = 5;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      await fetchLibraryFromGitHubOnce();
-      libraryLoaded = true;
-      return; // успех (включая честный 404 — библиотеки на GitHub ещё нет)
-    } catch (e) {
-      console.error(`Попытка ${attempt}/${MAX_ATTEMPTS} загрузить library.json с GitHub провалилась:`, e.message);
-      if (attempt === MAX_ATTEMPTS) {
-        throw new Error(`Не удалось загрузить библиотеку с GitHub после ${MAX_ATTEMPTS} попыток — не стартуем с пустыми данными`);
-      }
-      await new Promise((r) => setTimeout(r, attempt * 2000)); // 2s, 4s, 6s, 8s
-    }
-  }
-}
-
-/** Сохраняет текущую библиотеку в память И коммитит на GitHub. */
-async function saveLibrary() {
+app.get('/api/video/:fileId', ready, route(async (req, res) => {
+  const id = req.params.fileId;
+  if (!validId(id)) throw error(400, 'Некорректный файл');
+  if (!store.value.videos.some((v) => v.file_id === id)) throw error(404, 'Видео не найдено');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 600000);
+  res.on('close', () => controller.abort());
   try {
-    const content = Buffer.from(JSON.stringify(library, null, 2), 'utf8').toString('base64');
-    const body = {
-      message: `Update library: ${library.videos.length} videos, ${Object.keys(library.playlists).length} playlists`,
-      content,
-      branch: GH_BRANCH,
-      ...(librarySha ? { sha: librarySha } : {}),
-    };
-
-    const res = await fetch(GH_API, {
-      method: 'PUT',
-      headers: ghHeaders(),
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error(`Не удалось сохранить library.json на GitHub (${res.status}):`, errText.slice(0, 300));
-      return false;
+    let upstream;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const filePath = await resolveFile(id);
+      upstream = await fetch(`${TG_API}/file/bot${BOT_TOKEN}/${filePath}`, { headers: req.headers.range ? { range: req.headers.range } : {}, signal: controller.signal });
+      if (![404, 410].includes(upstream.status)) break;
+      await upstream.body?.cancel();
+      filePaths.delete(id);
     }
-
-    const data = await res.json();
-    librarySha = data.content.sha; // следующий PUT должен ссылаться на новый sha
-    return true;
-  } catch (e) {
-    console.error('Ошибка при сохранении library.json на GitHub:', e.message);
-    return false;
+    if (upstream.status === 416) {
+      if (upstream.headers.has('content-range')) res.set('content-range', upstream.headers.get('content-range'));
+      await upstream.body?.cancel();
+      return res.sendStatus(416);
+    }
+    if (!upstream.ok) { await upstream.body?.cancel(); throw error(502, 'Хранилище видео временно недоступно'); }
+    res.status(upstream.status).set({ 'content-type': 'video/mp4', 'accept-ranges': 'bytes', 'cache-control': 'private, max-age=3600' });
+    for (const h of ['content-length', 'content-range']) if (upstream.headers.has(h)) res.set(h, upstream.headers.get(h));
+    // Some Telegram download nodes ignore Range. Slice their stream without buffering it in memory.
+    const total = Number(upstream.headers.get('content-length'));
+    if (req.headers.range && upstream.status === 200 && total > 0) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range);
+      const start = match?.[1] ? Number(match[1]) : Math.max(0, total - Number(match?.[2]));
+      const end = match?.[1] && match?.[2] ? Math.min(total - 1, Number(match[2])) : total - 1;
+      if (!match || (!match[1] && !match[2]) || start > end || start >= total) { await upstream.body.cancel(); res.removeHeader('content-length'); return res.status(416).set('content-range', `bytes */${total}`).end(); }
+      res.status(206).set({ 'content-range': `bytes ${start}-${end}/${total}`, 'content-length': String(end - start + 1) });
+      if (req.method === 'HEAD') { await upstream.body.cancel(); return res.end(); }
+      let offset = 0;
+      const reader = upstream.body.getReader();
+      const selected = async function* () {
+        try {
+          while (offset <= end) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const from = Math.max(0, start - offset), to = Math.min(value.length, end + 1 - offset);
+            offset += value.length;
+            if (to > from) yield value.subarray(from, to);
+          }
+        } finally { await reader.cancel().catch(() => {}); }
+      };
+      await pipeline(Readable.from(selected()), res);
+    } else if (req.method === 'HEAD') { await upstream.body.cancel(); res.end(); }
+    else await pipeline(Readable.fromWeb(upstream.body), res);
+  } finally { clearTimeout(timeout); controller.abort(); }
+}));
+const jobs = new Map();
+let activeJob = null;
+const jobView = ({ id, name, status, progress, message, video }) => ({ id, name, status, progress, message, video });
+app.post('/api/uploads', auth, ready, route(async (req, res) => {
+  if (!CHAT_ID) throw error(503, 'Загрузка пока не настроена');
+  if (activeJob) throw error(429, 'Сейчас обрабатывается другой файл. Повторите через минуту.');
+  const name = String(req.query.name || '').normalize('NFC');
+  const playlist = String(req.query.playlist || '');
+  if (!safeName(name)) throw error(400, 'Некорректное имя файла');
+  if (Number(req.headers['content-length']) > MAX_UPLOAD) throw error(413, 'Максимальный размер — 512 МБ');
+  const job = { id: randomUUID(), name, status: 'uploading', progress: 0, controller: new AbortController() };
+  activeJob = job.id;
+  jobs.set(job.id, job);
+  let directory;
+  try {
+    directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'tiktok-upload-'));
+    const input = path.join(directory, 'input'), output = path.join(directory, 'video.mp4');
+    let received = 0;
+    const limit = new Transform({ transform(chunk, encoding, callback) { received += chunk.length; callback(received > MAX_UPLOAD ? error(413, 'Максимальный размер — 512 МБ') : null, chunk); } });
+    await pipeline(req, limit, fs.createWriteStream(input));
+    if (!received) throw error(400, 'Файл пуст');
+    job.status = 'processing';
+    res.status(202).json(jobView(job));
+    void (async () => {
+      try {
+        const info = await prepareVideo(input, output, { signal: job.controller.signal, progress: (value) => { job.progress = value; } });
+        job.status = 'sending';
+        const form = new FormData();
+        form.set('chat_id', CHAT_ID);
+        form.set('disable_notification', 'true');
+        form.set('supports_streaming', 'true');
+        form.set('caption', name);
+        form.set('video', await fs.openAsBlob(output, { type: 'video/mp4' }), name.replace(/\.[^.]+$/, '') + '.mp4');
+        const response = await fetch(`${TG_API}/bot${BOT_TOKEN}/sendVideo`, { method: 'POST', body: form, signal: AbortSignal.any([job.controller.signal, AbortSignal.timeout(300000)]) });
+        const data = await response.json();
+        if (!data.ok || !data.result?.video) throw error(502, 'Telegram не принял видео. Повторите загрузку.');
+        job.status = 'saving';
+        const video = { name, file_id: data.result.video.file_id, ...info, mtime: Math.floor(Date.now() / 1000) };
+        await store.mutate((draft) => {
+          if (Object.hasOwn(draft.deleted, name)) throw error(409, 'Файл с этим именем удалён. Переименуйте его перед загрузкой.');
+          mergeIngest(draft, { videos: [video] });
+          if (safeName(playlist) && Object.hasOwn(draft.playlists, playlist) && !draft.playlists[playlist].includes(name)) draft.playlists[playlist].unshift(name);
+        });
+        job.video = video;
+        job.progress = 100;
+        job.status = 'done';
+      } catch (failure) {
+        job.status = job.controller.signal.aborted ? 'cancelled' : 'error';
+        job.message = failure.status ? failure.message : 'Не удалось обработать видео. Проверьте файл и повторите.';
+      } finally {
+        await fsp.rm(directory, { recursive: true, force: true }).catch(() => {});
+        activeJob = null;
+        setTimeout(() => jobs.delete(job.id), 3600000).unref();
+      }
+    })();
+  } catch (failure) {
+    activeJob = null;
+    jobs.delete(job.id);
+    if (directory) await fsp.rm(directory, { recursive: true, force: true }).catch(() => {});
+    throw failure;
   }
+}));
+app.get('/api/uploads/:id', auth, (req, res) => {
+  const job = jobs.get(req.params.id);
+  return job ? res.json(jobView(job)) : res.status(404).json({ error: 'Задание не найдено; сервер мог перезапуститься. Обновите библиотеку перед повтором.' });
+});
+app.delete('/api/uploads/:id', auth, (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (job && ['processing', 'sending'].includes(job.status)) job.controller.abort();
+  res.json({ ok: true });
+});
+app.use((failure, req, res, next) => {
+  if (res.headersSent) return res.destroy();
+  res.status(failure.status || 502).json({ ok: false, error: failure.status ? failure.message : 'Сервис временно недоступен. Повторите попытку.' });
+});
+async function start() {
+  if (!BOT_TOKEN || !GH_TOKEN || !INGEST_KEY) throw new Error('BOT_TOKEN, GITHUB_TOKEN and INGEST_KEY are required');
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try { await store.load(); break; } catch (failure) {
+      if (attempt === 5) throw failure;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+    }
+  }
+  return app.listen(process.env.PORT || 3000, () => console.log(`Player API ${VERSION} ready`));
 }
-
-// ── Кэш file_path (getFile) в памяти процесса ───────────────
-const filePathCache = new Map(); // fileId -> { path, expires }
-
-function isValidFileId(id) {
-  return typeof id === 'string' && id.length > 0 && id.length <= 200 && /^[A-Za-z0-9_-]+$/.test(id);
-}
-
-async function resolveFilePath(fileId) {
-  const cached = filePathCache.get(fileId);
-  if (cached && cached.expires > Date.now()) return cached.path;
-
-  const res = await fetch(`${TG_API}/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
-  if (!res.ok) return null;
-
-  const data = await res.json();
-  if (!data.ok || !data.result?.file_path) return null;
-
-  const filePath = data.result.file_path;
-  filePathCache.set(fileId, { path: filePath, expires: Date.now() + FILE_PATH_TTL_MS });
-  return filePath;
-}
-
-// ── Роуты ────────────────────────────────────────────────────
-app.get('/api/library', (req, res) => {
-  // На практике недостижимо (app.listen идёт только после успешной загрузки),
-  // но если каким-то образом до сюда дошли раньше — лучше явная 503, чтобы
-  // фронт показал "не загрузилось, обнови", а не молчаливые 0 видео.
-  if (!libraryLoaded) {
-    return res.status(503).json({ ok: false, error: 'library not loaded yet, retry' });
-  }
-  res.json(library);
-});
-
-app.post('/api/playlists', async (req, res) => {
-  const playlists = req.body;
-  if (playlists === null || typeof playlists !== 'object' || Array.isArray(playlists)) {
-    return res.status(400).json({ ok: false, error: 'expected object' });
-  }
-  library.playlists = playlists;
-  const saved = await saveLibrary();
-  res.json({ ok: true, persisted: saved });
-});
-
-app.post('/api/ingest', async (req, res) => {
-  const key = req.header('x-ingest-key');
-  if (!INGEST_KEY || key !== INGEST_KEY) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
-
-  const body = req.body;
-  if (!Array.isArray(body.videos)) {
-    return res.status(400).json({ ok: false, error: 'videos must be an array' });
-  }
-
-  library.videos = body.videos;
-  if (body.playlists && typeof body.playlists === 'object' && !Array.isArray(body.playlists)) {
-    library.playlists = body.playlists;
-  }
-
-  const saved = await saveLibrary();
-  res.json({ ok: true, count: body.videos.length, persisted: saved });
-});
-
-app.get('/api/video/:fileId', async (req, res) => {
-  const fileId = req.params.fileId;
-  if (!isValidFileId(fileId)) return res.status(400).send('bad file_id');
-
-  let filePath = await resolveFilePath(fileId);
-  if (!filePath) return res.status(404).send('file not found');
-
-  const range = req.header('range');
-  const fetchUpstream = () =>
-    fetch(`${TG_API}/file/bot${BOT_TOKEN}/${filePath}`, { headers: range ? { range } : {} });
-
-  let upstream = await fetchUpstream();
-
-  if (upstream.status === 404 || upstream.status === 410) {
-    filePathCache.delete(fileId);
-    filePath = await resolveFilePath(fileId);
-    if (!filePath) return res.status(404).send('file not found');
-    upstream = await fetchUpstream();
-  }
-
-  if (!upstream.ok && upstream.status !== 206) {
-    return res.status(502).send('upstream error');
-  }
-
-  res.status(upstream.status);
-  res.set('content-type', 'video/mp4');
-  res.set('accept-ranges', 'bytes');
-  res.set('cache-control', 'public, max-age=3600');
-  for (const h of ['content-length', 'content-range']) {
-    const v = upstream.headers.get(h);
-    if (v) res.set(h, v);
-  }
-
-  const reader = upstream.body.getReader();
-  const pump = async () => {
-    const { done, value } = await reader.read();
-    if (done) return res.end();
-    res.write(Buffer.from(value));
-    pump();
-  };
-  pump().catch(() => res.end());
-});
-
-app.get('/healthz', (req, res) => res.send('ok'));
-
-// Библиотека грузится с GitHub ДО того, как сервис начнёт принимать трафик —
-// иначе первые запросы после рестарта получат пустой список. Если загрузка
-// провалилась после всех повторов — процесс завершается с ошибкой, а не
-// стартует молча с пустой библиотекой (Render перезапустит его сам).
-loadLibraryFromGitHub()
-  .then(() => {
-    app.listen(PORT, () => console.log(`API listening on :${PORT}`));
-  })
-  .catch((e) => {
-    console.error('ФАТАЛЬНО: не смог поднять библиотеку при старте —', e.message);
-    process.exit(1);
-  });
+if (require.main === module) start().catch(() => { console.error('Startup failed: persistent library unavailable or configuration missing'); process.exit(1); });
+module.exports = { app, start, store, resolveFile };
