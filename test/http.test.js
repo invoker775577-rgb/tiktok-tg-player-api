@@ -11,18 +11,21 @@ const exec = promisify(execFile);
 test('HTTP ranges, authorization, durable delete, and a real >50 MB upload', { timeout: 120000 }, async () => {
   let data = { videos: [{ name: 'one.mp4', file_id: 'one', size: 10 }], playlists: { favorites: ['one.mp4'] } };
   let sentBytes = 0;
+  const botMessages = [];
   const upstream = http.createServer(async (req, res) => {
     if (req.url.startsWith('/contents')) {
       if (req.method === 'PUT') { const chunks = []; for await (const chunk of req) chunks.push(chunk); const body = JSON.parse(Buffer.concat(chunks)); data = JSON.parse(Buffer.from(body.content, 'base64')); return res.end('{}'); }
       return res.end(JSON.stringify({ sha: 'sha', content: Buffer.from(JSON.stringify(data)).toString('base64') }));
     }
     if (req.url.includes('/getFile')) return res.end(JSON.stringify({ ok: true, result: { file_path: 'video.mp4' } }));
+    if (req.url.includes('/getMe')) return res.end(JSON.stringify({ ok: true, result: { username: 'TikTokdowmbot' } }));
+    if (req.url.includes('/sendMessage')) { const chunks = []; for await (const chunk of req) chunks.push(chunk); botMessages.push(JSON.parse(Buffer.concat(chunks))); return res.end(JSON.stringify({ ok: true, result: { message_id: 1 } })); }
     if (req.url.includes('/sendVideo')) { sentBytes = 0; for await (const chunk of req) sentBytes += chunk.length; return res.end(JSON.stringify({ ok: true, result: { video: { file_id: 'uploaded' } } })); }
     res.setHeader('content-length', '10'); res.end('0123456789'); // Deliberately ignores Range.
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${upstream.address().port}`;
-  Object.assign(process.env, { BOT_TOKEN: 'test', INGEST_KEY: 'key', GITHUB_TOKEN: 'test', CHAT_ID: '123', TELEGRAM_API_URL: base, GITHUB_CONTENTS_URL: base + '/contents' });
+  Object.assign(process.env, { BOT_TOKEN: 'test', INGEST_KEY: 'key', GITHUB_TOKEN: 'test', CHAT_ID: '123', WEBHOOK_SECRET: 'hook-secret', WEBAPP_URL: 'https://example.test/player', TELEGRAM_API_URL: base, GITHUB_CONTENTS_URL: base + '/contents' });
   const { app, store } = require('../server'); await store.load();
   const server = app.listen(0, '127.0.0.1'); await new Promise((resolve) => server.once('listening', resolve));
   const api = `http://127.0.0.1:${server.address().port}`;
@@ -37,6 +40,14 @@ test('HTTP ranges, authorization, durable delete, and a real >50 MB upload', { t
     assert.equal((await fetch(api + '/api/video/unknown')).status, 404);
     assert.equal((await fetch(api + '/api/videos/one.mp4', { method: 'DELETE' })).status, 401);
     const headers = { 'x-ingest-key': 'key' };
+    assert.equal((await fetch(api + '/bot/health')).status, 200);
+    const rejectedHook = await fetch(api + '/api/telegram/webhook', { method: 'POST', headers: { 'content-type':'application/json' }, body: JSON.stringify({ message: { chat: { id: 42 }, text: '/start' } }) });
+    assert.equal(rejectedHook.status, 401);
+    const acceptedHook = await fetch(api + '/api/telegram/webhook', { method: 'POST', headers: { 'content-type':'application/json', 'x-telegram-bot-api-secret-token':'hook-secret' }, body: JSON.stringify({ message: { chat: { id: 42 }, from: { id: 42 }, text: '/start' } }) });
+    assert.equal(acceptedHook.status, 200);
+    for (let attempt = 0; attempt < 20 && !botMessages.length; attempt++) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(botMessages.at(-1).chat_id, 42);
+    assert.equal(botMessages.at(-1).reply_markup.inline_keyboard[0][0].web_app.url, 'https://example.test/player');
     assert.equal((await fetch(api + '/api/videos/one.mp4', { method: 'DELETE', headers })).status, 200);
     assert.equal(store.value.videos.length, 0);
     assert.equal((await fetch(api + '/api/videos/one.mp4/restore', { method: 'POST', headers })).status, 200);

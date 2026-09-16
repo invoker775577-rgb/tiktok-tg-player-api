@@ -9,12 +9,14 @@ const { randomUUID } = require('node:crypto');
 const { createStore, mergeIngest, deleteVideo, restoreVideo } = require('./library-store');
 const { authorized } = require('./auth');
 const { prepareVideo } = require('./media');
-const VERSION = '2026.09.08.1';
+const VERSION = '2026.09.16.1';
 const BOT_TOKEN = process.env.BOT_TOKEN, INGEST_KEY = process.env.INGEST_KEY, GH_TOKEN = process.env.GITHUB_TOKEN, CHAT_ID = process.env.CHAT_ID;
 const OWNER_IDS = (process.env.OWNER_IDS || CHAT_ID || '').split(',').map((id) => id.trim());
 const GH_BRANCH = process.env.GITHUB_BRANCH || 'master';
 const GH_API = process.env.GITHUB_CONTENTS_URL || `https://api.github.com/repos/${process.env.GITHUB_REPO || 'invoker775577-rgb/tiktok-tg-player'}/contents/${process.env.GITHUB_LIBRARY_PATH || 'api-render/library.json'}`;
 const TG_API = process.env.TELEGRAM_API_URL || 'https://api.telegram.org';
+const WEBAPP_URL = process.env.WEBAPP_URL || 'https://tiktok-tg-player.onrender.com';
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
 const MAX_UPLOAD = 512 * 1024 * 1024;
 const app = express();
 app.disable('x-powered-by');
@@ -48,8 +50,38 @@ const safeName = (name) => typeof name === 'string' && name.trim().length > 0 &&
 const validId = (id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(id);
 function validPlaylists(value) { return value && !Array.isArray(value) && typeof value === 'object' && Object.entries(value).every(([key, items]) => safeName(key) && Array.isArray(items) && items.length <= 20000 && items.every(safeName)); }
 app.get('/healthz', (req, res) => res.status(store.value ? 200 : 503).json({ ok: !!store.value, version: VERSION }));
+app.get('/bot/health', route(async (req, res) => {
+  const response = await fetch(`${TG_API}/bot${BOT_TOKEN}/getMe`, { signal: AbortSignal.timeout(10000) });
+  const data = await response.json();
+  res.status(response.ok && data.ok ? 200 : 503).json({ ok: response.ok && data.ok, version: VERSION, username: data.result?.username || null, webhookSecretConfigured: !!WEBHOOK_SECRET });
+}));
 app.get('/api/library', ready, (req, res) => res.set('cache-control', 'private, no-cache').json({ videos: store.value.videos, playlists: store.value.playlists }));
 app.get('/api/access', auth, (req, res) => res.json({ ok: true, upload: !!CHAT_ID, maxUploadBytes: MAX_UPLOAD }));
+async function telegram(method, payload) {
+  const response = await fetch(`${TG_API}/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.ok === false) throw error(502, data.description || 'Telegram temporarily unavailable');
+  return data.result;
+}
+function webAppKeyboard() {
+  return { inline_keyboard: [[{ text: 'Открыть Тайник', web_app: { url: WEBAPP_URL } }], [{ text: 'Открыть в браузере', url: WEBAPP_URL }]] };
+}
+app.post('/api/telegram/webhook', route(async (req, res) => {
+  if (WEBHOOK_SECRET && req.get('x-telegram-bot-api-secret-token') !== WEBHOOK_SECRET) return res.sendStatus(401);
+  res.json({ ok: true });
+  const message = req.body?.message || req.body?.edited_message;
+  const chatId = message?.chat?.id;
+  if (!chatId || message?.from?.is_bot) return;
+  const text = String(message.text || '').trim();
+  if (!text || text.startsWith('/start') || text.startsWith('/help')) {
+    await telegram('sendMessage', {
+      chat_id: chatId,
+      text: 'Тайник снова здесь. Открой коллекцию эдитов кнопкой ниже.',
+      reply_markup: webAppKeyboard(),
+      disable_web_page_preview: true,
+    });
+  }
+}));
 app.post('/api/playlists', auth, ready, route(async (req, res) => {
   if (!validPlaylists(req.body)) throw error(400, 'Некорректные плейлисты');
   await store.mutate((draft) => { draft.playlists = req.body; });
